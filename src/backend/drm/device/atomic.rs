@@ -11,6 +11,7 @@ use drm::control::{
 };
 
 use super::DrmDeviceFd;
+use super::saved_ctm::SavedCtm;
 use crate::backend::drm::error::AccessError;
 use crate::{backend::drm::error::Error, utils::DevPath};
 
@@ -85,6 +86,8 @@ pub struct AtomicDrmDevice {
     pub(crate) fd: DrmDeviceFd,
     pub(crate) active: Arc<AtomicBool>,
     old_state: OldState,
+    // Creator references retained until AFTER the shutdown atomic commit.
+    saved_ctms: Vec<(crtc::Handle, property::Handle, SavedCtm<DrmDeviceFd>)>,
     pub(crate) prop_mapping: Arc<RwLock<PropMapping>>,
     pub(super) span: tracing::Span,
 }
@@ -96,6 +99,7 @@ impl AtomicDrmDevice {
             fd,
             active,
             old_state: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+            saved_ctms: Vec::new(),
             prop_mapping: Default::default(),
             span,
         };
@@ -127,6 +131,28 @@ impl AtomicDrmDevice {
         add_props(&dev.fd, res_handles.crtcs(), &mut old_state.1)?;
         add_props(&dev.fd, res_handles.framebuffers(), &mut old_state.2)?;
         add_props(&dev.fd, &planes, &mut old_state.3)?;
+
+        for (crtc, props) in &old_state.1 {
+            for (&prop, &value) in props {
+                let info = dev.fd.get_property(prop).map_err(|source| {
+                    Error::Access(AccessError {
+                        errmsg: "Error identifying saved CRTC property",
+                        dev: dev.fd.dev_path(),
+                        source,
+                    })
+                })?;
+                if info.name().to_bytes() == b"CTM" {
+                    let saved = SavedCtm::new(dev.fd.clone(), value).map_err(|source| {
+                        Error::Access(AccessError {
+                            errmsg: "Error retaining saved CTM",
+                            dev: dev.fd.dev_path(),
+                            source,
+                        })
+                    })?;
+                    dev.saved_ctms.push((*crtc, prop, saved));
+                }
+            }
+        }
 
         // And because the mapping is not consistent across devices,
         // we also need to lookup the handle for a property name.
@@ -264,7 +290,16 @@ impl Drop for AtomicDrmDevice {
             }
 
             add_multiple_props(&mut req, &self.old_state.0);
-            add_multiple_props(&mut req, &self.old_state.1);
+            for (crtc, props) in &self.old_state.1 {
+                for (&prop, &original) in props {
+                    let value = self
+                        .saved_ctms
+                        .iter()
+                        .find(|(c, p, _)| c == crtc && *p == prop)
+                        .map_or(original, |(_, _, saved)| saved.blob);
+                    req.add_raw_property((*crtc).into(), prop, value);
+                }
+            }
             add_multiple_props(&mut req, &self.old_state.2);
             add_multiple_props(&mut req, &self.old_state.3);
 

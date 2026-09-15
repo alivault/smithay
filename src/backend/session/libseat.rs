@@ -60,6 +60,17 @@ pub struct LibSeatSessionNotifier {
 impl LibSeatSession {
     /// Tries to create a new session via libseat.
     pub fn new() -> Result<(LibSeatSession, LibSeatSessionNotifier), Error> {
+        Self::new_with_pre_disable(|| {})
+    }
+
+    /// Create a session with synchronous cleanup inside libseat's disable
+    /// callback, BEFORE it returns to the backend (including logind's early
+    /// PauseDeviceComplete). Do not call back into libseat from this hook.
+    /// Forced device revocation cannot provide this guarantee; cleanup must
+    /// tolerate revoked devices and must never defer writes until PauseSession.
+    pub fn new_with_pre_disable(
+        mut pre_disable: impl FnMut() + 'static,
+    ) -> Result<(LibSeatSession, LibSeatSessionNotifier), Error> {
         let span = info_span!("backend_session", "type" = "libseat");
         let _guard = span.enter();
         let (tx, rx) = calloop::channel::channel();
@@ -72,7 +83,7 @@ impl LibSeatSession {
                 }
                 SeatEvent::Disable => {
                     debug!("Disable callback called");
-                    tx.send(event).unwrap();
+                    before_disable_ack(&mut pre_disable, || tx.send(event).unwrap());
                 }
             })
         };
@@ -108,6 +119,35 @@ impl LibSeatSession {
             (session, notifier)
         })
         .map_err(|err| Error::FailedToOpenSession(Errno::from_raw_os_error(err.into())))
+    }
+}
+
+// Keep ordering testable without opening a real seat or switching a user's VT.
+fn before_disable_ack(cleanup: &mut impl FnMut(), enqueue_pause: impl FnOnce()) {
+    cleanup();
+    enqueue_pause();
+}
+
+#[cfg(test)]
+mod pre_disable_tests {
+    #[test]
+    fn cleanup_precedes_event_queue_and_backend_ack() {
+        use std::cell::RefCell;
+        let trace = RefCell::new(Vec::new());
+        // logind ACKs immediately after this callback returns; seatd ACKs later
+        // in process_events. In both cases restoration is already complete.
+        super::before_disable_ack(&mut || trace.borrow_mut().push("restore while permitted"), || {
+            trace.borrow_mut().push("queue PauseSession")
+        });
+        trace.borrow_mut().push("backend may ACK/revoke");
+        assert_eq!(
+            *trace.borrow(),
+            [
+                "restore while permitted",
+                "queue PauseSession",
+                "backend may ACK/revoke"
+            ]
+        );
     }
 }
 
