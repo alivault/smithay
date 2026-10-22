@@ -12,6 +12,11 @@ use crate::utils::SealedFile;
 pub struct KeymapFileId([u8; 32]);
 
 impl KeymapFileId {
+    /// No keymap: what the seat holds as active once its wl_keyboards disagree
+    /// (a new one got the seat's keymap while a virtual keyboard's was active),
+    /// so the next keymap is sent to every one. Never a SHA-256 of a keymap.
+    pub(crate) const UNKNOWN: KeymapFileId = KeymapFileId([0; 32]);
+
     fn for_keymap(keymap: &str) -> Self {
         // Use a hash, so `keymap` events aren't sent when keymap hasn't changed, particularly
         // with `virtual-keyboard-unstable-v1`.

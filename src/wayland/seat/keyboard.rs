@@ -11,6 +11,7 @@ use wayland_server::{
 };
 
 use super::WaylandFocus;
+use crate::input::keyboard::KeymapFileId;
 use crate::{
     backend::input::{KeyState, Keycode},
     input::{
@@ -61,6 +62,18 @@ where
         // prepare a tempfile with the keymap, to send it to the client
         let keymap_file = self.arc.keymap.lock().unwrap();
         let ret = keymap_file.send(&kbd);
+
+        // A virtual keyboard's keymap may be the active one (sent to the keyboards
+        // that existed then): this keyboard has the seat's. Forget which is active,
+        // so the next key from either sends its keymap again, to this one too;
+        // else a virtual key reaches this client read with the seat's keymap
+        // (wtype's first keycode, 9, is Escape there).
+        {
+            let mut active = self.arc.active_keymap.write().unwrap();
+            if *active != keymap_file.id() {
+                *active = KeymapFileId::UNKNOWN;
+            }
+        }
 
         if let Err(e) = ret {
             warn!(
